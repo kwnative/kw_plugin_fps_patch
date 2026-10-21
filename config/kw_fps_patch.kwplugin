@@ -1,0 +1,8 @@
+# Restart after changing enabled (0 or 1).
+id=fps_patch
+library=kw_fps_patch.dll
+abi=1
+enabled=1
+roles=rendered
+requires=
+after=pacing

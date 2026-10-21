@@ -1,0 +1,256 @@
+#include "runtime.h"
+
+#include "config.h"
+#include <kwengine/timing/game_layout.h>
+#include "game_patches.h"
+#include "log.h"
+#include "memory_patch.h"
+
+/* The plugin adapter supplies matching artifact/config/log names. Defaults
+ * remain available to isolated offline fixtures of this runtime. */
+#ifndef FPS_PATCH_INI_NAME
+#define FPS_PATCH_INI_NAME L"fps_patch.ini"
+#define FPS_PATCH_INI_LABEL "fps_patch.ini"
+#define FPS_PATCH_LOG_NAME L"fps_patch.log"
+#endif
+
+typedef struct FpsRuntime {
+    HMODULE self_module;
+    FpsConfig config;
+    GameLayout game;
+    GameResolveDiagnostic discovery;
+    /* Prepared before native callbacks; retained for deferred diagnostic logging. */
+    volatile LONG bootstrap_status;
+    volatile LONG activation_logged;
+    BOOL disabled;
+    wchar_t ini_path[MAX_PATH];
+    wchar_t log_path[MAX_PATH];
+} FpsRuntime;
+
+typedef int(THISCALL *RuntimeConfigThiscallFn)(void *original_this);
+typedef int (*RuntimeConfigNoArgFn)(void);
+typedef int (*StartSessionTailFn)(void);
+
+/* One owner for configuration, resolved addresses, and lifecycle state. */
+static FpsRuntime fps_runtime;
+static INIT_ONCE fps_file_init_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK initialize_runtime_files_once(PINIT_ONCE init_once, PVOID parameter, PVOID *context)
+{
+    FpsRuntime *runtime = (FpsRuntime *)parameter;
+    BOOL ini_found;
+    (void)init_once;
+    (void)context;
+
+    /* Runs from normal plugin/game execution, never under the loader lock. */
+    config_set_defaults(&runtime->config);
+    if (GetModuleFileNameW(runtime->self_module, runtime->ini_path, ARRAY_COUNT(runtime->ini_path)) == 0 ||
+        !path_replace_filename(runtime->ini_path, ARRAY_COUNT(runtime->ini_path), FPS_PATCH_INI_NAME) ||
+        !wide_copy(runtime->log_path, ARRAY_COUNT(runtime->log_path), runtime->ini_path) ||
+        !path_replace_filename(runtime->log_path, ARRAY_COUNT(runtime->log_path), FPS_PATCH_LOG_NAME)) {
+        runtime->disabled = TRUE;
+        return TRUE;
+    }
+
+    ini_found = config_load(&runtime->config, runtime->ini_path);
+    log_open(runtime->log_path, runtime->config.logging);
+    log_line("fps_patch bootstrap");
+    log_text("Resolved target: ");
+    log_line(runtime->game.target_name != NULL ? runtime->game.target_name : "unresolved executable");
+    log_hex32("PE timestamp=", runtime->game.pe_timestamp);
+    log_hex32("PE image size=", runtime->game.pe_size_of_image);
+    log_line(ini_found ? "Configuration: " FPS_PATCH_INI_LABEL " loaded" : "Configuration: using built-in defaults");
+    log_u32("target_fps=", runtime->config.target_fps);
+    log_u32("diagnostics=", (u32)runtime->config.diagnostics);
+    log_u32("stall_guard=", (u32)runtime->config.stall_guard);
+    log_u32("bootstrap_status=", (u32)runtime->bootstrap_status);
+    log_text("Discovery stage: ");
+    log_line(game_resolve_stage_name(runtime->discovery.stage));
+    if (runtime->game.module != NULL) {
+        log_line(runtime->game.keyboard.repeat_entry_kind == KEYBOARD_REPEAT_PROTECTED_ENTRY
+                     ? "Keyboard repeat: validated protected native entry (original forwarding)"
+                     : "Keyboard repeat: validated native body");
+    }
+
+    if (!runtime->config.valid) {
+        log_line("ERROR: target_fps must be 45, 60, 75, or 90");
+        runtime->disabled = TRUE;
+    } else if (!runtime->config.enabled) {
+        log_line("Patch disabled by configuration");
+        runtime->disabled = TRUE;
+    } else if (runtime->bootstrap_status != BOOTSTRAP_INSTALLED) {
+        log_line("ERROR: bootstrap callsite hooks were not installed");
+        runtime->disabled = TRUE;
+    }
+
+    /* Returning TRUE makes initialization terminal, including disabled states. */
+    return TRUE;
+}
+
+static BOOL initialize_runtime_files(FpsRuntime *runtime)
+{
+    if (!InitOnceExecuteOnce(&fps_file_init_once, initialize_runtime_files_once, runtime, NULL)) {
+        runtime->disabled = TRUE;
+        return FALSE;
+    }
+    return !runtime->disabled;
+}
+
+static BOOL apply_fixed_rate(FpsRuntime *runtime)
+{
+    const TimingLayout *timing = &runtime->game.timing;
+    const PacingLayout *pacing = &runtime->game.pacing;
+    const u32 target_fps = runtime->config.target_fps;
+    const u32 ratio = target_fps / 15u;
+    /* History estimates wall-clock FPS; W3D intentionally preserves retail 30*33. */
+    const u32 frame_seed_ms = 1000u / target_fps;
+    const u32 w3d_step_ms = 990u / target_fps;
+    u8 *engine = *(u8 **)game_address(&runtime->game, timing->game_engine_pointer);
+    u8 *global_data = *(u8 **)game_address(&runtime->game, timing->global_data_pointer);
+    u32 i;
+
+    if (engine == NULL || global_data == NULL) {
+        log_line("ERROR: live GameEngine or GlobalData pointer is null");
+        return FALSE;
+    }
+
+    /*
+     * These globals are writable runtime state, not code operands. Static
+     * instruction redirections were installed transactionally before this
+     * function is allowed to change any of them.
+     */
+    *(u32 *)game_address(&runtime->game, timing->client_fps) = target_fps;
+    /*
+     * Startup cached three representations of the client rate. They have
+     * different units and must all track the raised rate:
+     *
+     *   float(client FPS)
+     *   1000 / FPS  -- audio milliseconds per client frame
+     *   1 / FPS     -- visual seconds per client frame
+     *
+     * The nearby 15 Hz logic constants and the shaders' separate 30-frame
+     * particle time domain intentionally remain unchanged.
+     */
+    *(float *)game_address(&runtime->game, timing->client_fps_float) = (float)target_fps;
+    *(float *)game_address(&runtime->game, timing->audio_milliseconds_per_frame) = 1000.0f / (float)target_fps;
+    *(float *)game_address(&runtime->game, timing->visual_seconds_per_frame) = 1.0f / (float)target_fps;
+    *(u32 *)game_address(&runtime->game, timing->w3d_milliseconds_per_frame) = w3d_step_ms;
+
+    global_data[GLOBAL_DATA_USE_FPS_LIMIT] = 1;
+    *(u32 *)(global_data + GLOBAL_DATA_FPS_LIMIT) = target_fps;
+    *(u32 *)(engine + ENGINE_MAX_UPDATE_FPS) = target_fps;
+    *(u32 *)(engine + ENGINE_NOMINAL_CLIENT_FRAMES_PER_LOGIC_TICK) = ratio;
+    *(u32 *)(engine + ENGINE_PACING_UPDATE_MULTIPLIER) = ratio;
+    /* Avoid a startup transient while the 64-sample FPS estimate fills. */
+    for (i = 0; i < ENGINE_FRAME_DURATION_HISTORY_COUNT; ++i) {
+        *(u32 *)(engine + ENGINE_FRAME_DURATION_HISTORY_MS + i * 4u) = frame_seed_ms;
+    }
+    *(u32 *)(engine + ENGINE_FRAME_DURATION_HISTORY_SUM_MS) = frame_seed_ms * ENGINE_FRAME_DURATION_HISTORY_COUNT;
+    *(u32 *)(engine + ENGINE_FRAME_DURATION_HISTORY_INDEX) = 0;
+    *(u32 *)game_address(&runtime->game, pacing->previous_frame_time_ms) = timeGetTime();
+
+    game_patches_reset_state();
+    log_u32("Applied client FPS=", target_fps);
+    log_u32("Applied initial W3D milliseconds/client-frame=", w3d_step_ms);
+    log_hex32("Applied audio milliseconds/client-frame bits=", load_u32(game_address(&runtime->game, timing->audio_milliseconds_per_frame)));
+    return TRUE;
+}
+
+static void apply_from_game_hook(FpsRuntime *runtime, const char *source)
+{
+    if (!initialize_runtime_files(runtime))
+        return;
+    log_text("Game hook reached: ");
+    log_line(source);
+
+    /* Static code writes happen once; live fields are reapplied on every session hook. */
+    if (!game_patches_install(&runtime->game, &runtime->config)) {
+        runtime->disabled = TRUE;
+        log_line("ERROR: disabling patch after static installation failure");
+    } else if (!apply_fixed_rate(runtime)) {
+        runtime->disabled = TRUE;
+        log_line("ERROR: disabling patch after live-state initialization failure");
+    }
+}
+
+static BOOL install_bootstrap_hooks(FpsRuntime *runtime)
+{
+    const BootstrapLayout *bootstrap = &runtime->game.bootstrap;
+    const void *runtime_hook;
+    PatchTransaction transaction;
+    u8 runtime_patch[5] = {0xE8, 0, 0, 0, 0};
+    u8 session_patch[5] = {0xE9, 0, 0, 0, 0};
+
+    runtime_hook = bootstrap->runtime_config_hook_kind == RUNTIME_CONFIG_HOOK_NOARG ? (const void *)runtime_config_noarg_hook
+                                                                                    : (const void *)runtime_config_thiscall_hook;
+    encode_rel32(&runtime_patch[1], game_address(&runtime->game, bootstrap->runtime_config_call.instruction + 5u), runtime_hook);
+    encode_rel32(&session_patch[1], game_address(&runtime->game, bootstrap->start_session_tail.instruction + 5u), start_session_tail_hook);
+
+    /* The pair is atomic from the patch's perspective: restore the first if the second fails. */
+    patch_transaction_init(&transaction);
+    if (!patch_transaction_write(&transaction, game_address(&runtime->game, bootstrap->runtime_config_call.instruction), runtime_patch,
+                                 sizeof(runtime_patch)) ||
+        !patch_transaction_write(&transaction, game_address(&runtime->game, bootstrap->start_session_tail.instruction), session_patch,
+                                 sizeof(session_patch))) {
+        patch_transaction_rollback(&transaction);
+        runtime->bootstrap_status = BOOTSTRAP_WRITE_FAILED;
+        return FALSE;
+    }
+    runtime->bootstrap_status = BOOTSTRAP_INSTALLED;
+    return TRUE;
+}
+
+BOOL runtime_attach(HMODULE self_module, u8 *game_module)
+{
+    GameResolveResult result;
+
+    fps_runtime.self_module = self_module;
+    /* Resolution is read-only and must complete before any game byte is changed. */
+    result = resolve_game_layout_ex(&fps_runtime.game, game_module, &fps_runtime.discovery);
+    if (result == GAME_INVALID_PE) {
+        fps_runtime.bootstrap_status = BOOTSTRAP_BAD_PE;
+        return FALSE;
+    }
+    if (result != GAME_RESOLVED) {
+        fps_runtime.bootstrap_status = BOOTSTRAP_BAD_PATCH_SITES;
+        return FALSE;
+    }
+    return install_bootstrap_hooks(&fps_runtime);
+}
+
+void fps_runtime_log_activation(void)
+{
+    /* Record the armed bootstrap once, before native runtime callbacks execute. */
+    initialize_runtime_files(&fps_runtime);
+    if (InterlockedCompareExchange(&fps_runtime.activation_logged, 1, 0) == 0) {
+        log_line("FPS plugin activation checkpoint");
+    }
+}
+
+int THISCALL runtime_config_thiscall_hook(void *original_this)
+{
+    RuntimeConfigThiscallFn original =
+        (RuntimeConfigThiscallFn)game_address(&fps_runtime.game, fps_runtime.game.bootstrap.runtime_config_call.target);
+    /* Preserve the original call's side effects and ABI-visible return value. */
+    int result = original(original_this);
+    apply_from_game_hook(&fps_runtime, "GameEngine runtime configuration trigger (__thiscall)");
+    return result;
+}
+
+int runtime_config_noarg_hook(void)
+{
+    RuntimeConfigNoArgFn original = (RuntimeConfigNoArgFn)game_address(&fps_runtime.game, fps_runtime.game.bootstrap.runtime_config_call.target);
+    /* TW uses a no-argument call at the equivalent late initialization point. */
+    int result = original();
+    apply_from_game_hook(&fps_runtime, "GameEngine runtime configuration trigger (no-arg)");
+    return result;
+}
+
+int start_session_tail_hook(void)
+{
+    StartSessionTailFn original = (StartSessionTailFn)game_address(&fps_runtime.game, fps_runtime.game.bootstrap.start_session_tail.target);
+    /* The replaced JMP was a tail call, so returning its result is equivalent. */
+    int result = original();
+    apply_from_game_hook(&fps_runtime, "GameEngine_StartGameSession tail");
+    return result;
+}
