@@ -3,6 +3,7 @@
 #include "log.h"
 #include "memory_patch.h"
 #include "stall_guard.h"
+#include <kwfps/integration/render_clock.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -46,13 +47,130 @@ static struct sg_policy g_stall;
 static struct sg_clock g_frame_clock;
 static u32 g_guard_particle_fraction, g_guard_audio_fraction;
 static void stall_apply_pending(void *engine_pointer);
+/* Optional frozen rendering lane; zero-cost domain selection when unused
+ * apart from one atomic word read. Source timing remains the original owner. */
+#define FPS_CLOCK_MAGIC UINT32_C(0x46504331)
+#define FPS_CLOCK_LIVE UINT32_C(0x80000000)
+#define FPS_CLOCK_WRITING UINT32_MAX
+struct kwfps_render_snapshot {
+    uint32_t magic,creator,state,session;
+    struct sg_clock clock;
+    uint32_t target,active,guard,remainder,accumulated,step;
+};
+static uint32_t g_render_clock_tid,g_render_clock_readers,g_render_clock_session;
+static struct kwfps_render_snapshot *g_render_clock_current;
+static struct kwfps_clock_scope_v1 *g_render_clock_top;
+static kwfps_clock_drain_v1 g_render_clock_drain;
+static void *g_render_clock_drain_context;
+static struct kwfps_render_snapshot *render_clock_current(void)
+{
+    uint32_t owner=__atomic_load_n(&g_render_clock_tid,__ATOMIC_ACQUIRE);
+    return owner && owner==GetCurrentThreadId() ? g_render_clock_current : NULL;
+}
+static BOOL render_clock_source_barrier(void)
+{
+    if (!__atomic_load_n(&g_render_clock_readers,__ATOMIC_ACQUIRE)) return TRUE;
+    /* A renderer must not join itself from a canonical rate/session writer. */
+    if (render_clock_current() || !g_render_clock_drain) return FALSE;
+    g_render_clock_drain(g_render_clock_drain_context);
+    return !__atomic_load_n(&g_render_clock_readers,__ATOMIC_ACQUIRE);
+}
 static u32 active_client_fps(void)
 {
+    struct kwfps_render_snapshot *snapshot=render_clock_current();
+    if (snapshot) return snapshot->active;
     return g_config->stall_guard && g_stall.active ? g_stall.active : g_config->target_fps;
+}
+static uint32_t render_clock_create(struct kwfps_render_snapshot **out)
+{
+    if (!out || *out) return KWFPS_CLOCK_ARGUMENT;
+    struct kwfps_render_snapshot *s=HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,sizeof(*s));
+    if (!s) return KWFPS_CLOCK_NOT_READY;
+    s->magic=FPS_CLOCK_MAGIC;s->creator=GetCurrentThreadId();*out=s;return KWFPS_CLOCK_OK;
+}
+static uint32_t render_clock_capture(struct kwfps_render_snapshot *s)
+{
+    if (!s || s->magic!=FPS_CLOCK_MAGIC) return KWFPS_CLOCK_ARGUMENT;
+    if (s->creator!=GetCurrentThreadId()) return KWFPS_CLOCK_WRONG_THREAD;
+    if (!g_installed || !g_game || !g_config || !g_render_clock_drain ||
+        g_render_clock_session==UINT32_MAX || !g_frame_clock.count || g_frame_clock.count>SG_EPOCHS) return KWFPS_CLOCK_NOT_READY;
+    uint32_t expected=0;
+    if (!__atomic_compare_exchange_n(&s->state,&expected,FPS_CLOCK_WRITING,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return KWFPS_CLOCK_BUSY;
+    void *client=*(void **)game_address(g_game,g_game->timing.game_client_pointer);
+    if (!client) {__atomic_store_n(&s->state,0,__ATOMIC_RELEASE);return KWFPS_CLOCK_NOT_READY;}
+    typedef u32(THISCALL *GetFrame)(void *);
+    uint32_t frame=((GetFrame)(*(void ***)client)[0x78u/sizeof(void *)])(client);
+    s->clock=g_frame_clock;sg_clock_sample(&s->clock,frame);
+    s->target=g_config->target_fps;s->active=g_config->stall_guard && g_stall.active ? g_stall.active : g_config->target_fps;
+    s->guard=g_config->stall_guard;s->remainder=g_w3d_time_remainder;
+    s->accumulated=*(u32 *)game_address(g_game,g_game->timing.w3d_accumulated_time_ms);
+    s->step=*(u32 *)game_address(g_game,g_game->timing.w3d_milliseconds_per_frame);
+    s->session=g_render_clock_session;
+    __atomic_fetch_add(&g_render_clock_readers,1,__ATOMIC_ACQ_REL);
+    __atomic_store_n(&s->state,FPS_CLOCK_LIVE,__ATOMIC_RELEASE);return KWFPS_CLOCK_OK;
+}
+static uint32_t render_clock_release(struct kwfps_render_snapshot *s)
+{
+    if (!s || s->magic!=FPS_CLOCK_MAGIC) return KWFPS_CLOCK_ARGUMENT;
+    if (s->creator!=GetCurrentThreadId()) return KWFPS_CLOCK_WRONG_THREAD;
+    uint32_t expected=FPS_CLOCK_LIVE;
+    if (!__atomic_compare_exchange_n(&s->state,&expected,0,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
+        return expected ? KWFPS_CLOCK_BUSY : KWFPS_CLOCK_NOT_READY;
+    __atomic_fetch_sub(&g_render_clock_readers,1,__ATOMIC_ACQ_REL);return KWFPS_CLOCK_OK;
+}
+static uint32_t render_clock_destroy(struct kwfps_render_snapshot *s)
+{
+    if (!s || s->magic!=FPS_CLOCK_MAGIC) return KWFPS_CLOCK_ARGUMENT;
+    if (s->creator!=GetCurrentThreadId()) return KWFPS_CLOCK_WRONG_THREAD;
+    if (__atomic_load_n(&s->state,__ATOMIC_ACQUIRE)) {
+        uint32_t status=render_clock_release(s);if (status) return status;
+    }
+    s->magic=0;return HeapFree(GetProcessHeap(),0,s) ? KWFPS_CLOCK_OK : KWFPS_CLOCK_ARGUMENT;
+}
+static uint32_t render_clock_enter(struct kwfps_render_snapshot *s,struct kwfps_clock_scope_v1 *scope)
+{
+    if (!s || s->magic!=FPS_CLOCK_MAGIC || !scope || scope->current || scope->previous || scope->owner) return KWFPS_CLOCK_ARGUMENT;
+    uint32_t state=__atomic_load_n(&s->state,__ATOMIC_ACQUIRE);
+    for (;;) {
+        if (!(state&FPS_CLOCK_LIVE) || state==FPS_CLOCK_WRITING) return KWFPS_CLOCK_NOT_READY;
+        if (state==FPS_CLOCK_WRITING-1) return KWFPS_CLOCK_BUSY;
+        if (__atomic_compare_exchange_n(&s->state,&state,state+1,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) break;
+    }
+    if (s->session!=g_render_clock_session) {__atomic_fetch_sub(&s->state,1,__ATOMIC_RELEASE);return KWFPS_CLOCK_STALE;}
+    uint32_t tid=GetCurrentThreadId(),expected=0;
+    if (!__atomic_compare_exchange_n(&g_render_clock_tid,&expected,tid,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE) && expected!=tid) {
+        __atomic_fetch_sub(&s->state,1,__ATOMIC_RELEASE);return KWFPS_CLOCK_BUSY;
+    }
+    scope->current=s;scope->previous=g_render_clock_top;scope->owner=tid;
+    g_render_clock_top=scope;g_render_clock_current=s;return KWFPS_CLOCK_OK;
+}
+static uint32_t render_clock_leave(struct kwfps_clock_scope_v1 *scope)
+{
+    if (!scope || !scope->current) return KWFPS_CLOCK_ARGUMENT;
+    if (scope->owner!=GetCurrentThreadId() || __atomic_load_n(&g_render_clock_tid,__ATOMIC_ACQUIRE)!=scope->owner) return KWFPS_CLOCK_WRONG_THREAD;
+    if (g_render_clock_top!=scope) return KWFPS_CLOCK_BUSY;
+    struct kwfps_render_snapshot *s=scope->current;
+    g_render_clock_top=scope->previous;
+    g_render_clock_current=g_render_clock_top ? g_render_clock_top->current : NULL;
+    __atomic_fetch_sub(&s->state,1,__ATOMIC_RELEASE);
+    if (!scope->previous) __atomic_store_n(&g_render_clock_tid,0,__ATOMIC_RELEASE);
+    memset(scope,0,sizeof(*scope));return KWFPS_CLOCK_OK;
+}
+static uint32_t render_clock_set_drain(kwfps_clock_drain_v1 drain,void *context)
+{
+    if (__atomic_load_n(&g_render_clock_readers,__ATOMIC_ACQUIRE)) return KWFPS_CLOCK_BUSY;
+    if (g_render_clock_drain && drain && (g_render_clock_drain!=drain || g_render_clock_drain_context!=context)) return KWFPS_CLOCK_BUSY;
+    g_render_clock_drain=drain;g_render_clock_drain_context=context;return KWFPS_CLOCK_OK;
+}
+__declspec(dllexport) const struct kwfps_render_clock_api_v1 *kwfps_get_render_clock_api_v1(uint32_t abi)
+{
+    static const struct kwfps_render_clock_api_v1 api={KWFPS_RENDER_CLOCK_ABI_V1,sizeof(api),sizeof(struct kwfps_render_snapshot),
+        render_clock_create,render_clock_capture,render_clock_release,render_clock_destroy,render_clock_enter,render_clock_leave,render_clock_set_drain};
+    return abi==KWFPS_RENDER_CLOCK_ABI_V1 ? &api : NULL;
 }
 static void frame_clock_sample(void *client)
 {
-    if (!client || !g_config->stall_guard)
+    if (render_clock_current() || !client || !g_config->stall_guard)
         return;
     void **vtable = *(void ***)client;
     typedef u32(THISCALL * GetFrame)(void *);
@@ -60,6 +178,7 @@ static void frame_clock_sample(void *client)
 }
 static void frame_clock_sample_current(void)
 {
+    if (render_clock_current()) return;
     frame_clock_sample(*(void **)game_address(g_game, g_game->timing.game_client_pointer));
 }
 
@@ -306,30 +425,35 @@ static BOOL STDCALL is_client_slice_end(u32 phase)
 static u32 STDCALL advance_w3d_time(u32 client_frame_delta)
 {
     const TimingLayout *timing = &g_game->timing;
-    volatile u32 *accumulated = (volatile u32 *)game_address(g_game, timing->w3d_accumulated_time_ms);
-    volatile u32 *live_step = (volatile u32 *)game_address(g_game, timing->w3d_milliseconds_per_frame);
+    struct kwfps_render_snapshot *snapshot=render_clock_current();
+    u32 *remainder=snapshot ? &snapshot->remainder : &g_w3d_time_remainder;
+    struct sg_clock *clock=snapshot ? &snapshot->clock : &g_frame_clock;
+    u32 target=snapshot ? snapshot->target : g_config->target_fps;
+    BOOL guard=snapshot ? snapshot->guard!=0 : g_config->stall_guard;
+    volatile u32 *accumulated = snapshot ? &snapshot->accumulated : (volatile u32 *)game_address(g_game, timing->w3d_accumulated_time_ms);
+    volatile u32 *live_step = snapshot ? &snapshot->step : (volatile u32 *)game_address(g_game, timing->w3d_milliseconds_per_frame);
     u32 current = *accumulated;
     u32 scaled;
     u32 elapsed;
 
     /* Fixed-point accumulator: numerator units are W3D-ms * targetFPS. */
-    if (g_config->stall_guard) {
+    if (guard) {
         frame_clock_sample_current();
-        uint64_t duration = sg_clock_span(&g_frame_clock, client_frame_delta);
-        uint64_t numerator = g_w3d_time_remainder + duration * W3D_RETAIL_MILLISECONDS_PER_SECOND;
+        uint64_t duration = sg_clock_span(clock, client_frame_delta);
+        uint64_t numerator = (*remainder) + duration * W3D_RETAIL_MILLISECONDS_PER_SECOND;
         elapsed = (u32)(numerator / SG_TIMEBASE);
-        g_w3d_time_remainder = (u32)(numerator % SG_TIMEBASE);
+        (*remainder) = (u32)(numerator % SG_TIMEBASE);
     } else {
-        scaled = g_w3d_time_remainder + client_frame_delta * W3D_RETAIL_MILLISECONDS_PER_SECOND;
-        elapsed = scaled / g_config->target_fps;
-        g_w3d_time_remainder = scaled % g_config->target_fps;
+        scaled = (*remainder) + client_frame_delta * W3D_RETAIL_MILLISECONDS_PER_SECOND;
+        elapsed = scaled / target;
+        (*remainder) = scaled % target;
     }
     current += elapsed;
     *accumulated = current;
     /* Publish the next quotient so direct step readers share the same long-term rate. */
-    *live_step = g_config->stall_guard
-                     ? (g_w3d_time_remainder + (SG_TIMEBASE / active_client_fps()) * W3D_RETAIL_MILLISECONDS_PER_SECOND) / SG_TIMEBASE
-                     : (g_w3d_time_remainder + W3D_RETAIL_MILLISECONDS_PER_SECOND) / g_config->target_fps;
+    *live_step = guard
+                     ? ((*remainder) + (SG_TIMEBASE / active_client_fps()) * W3D_RETAIL_MILLISECONDS_PER_SECOND) / SG_TIMEBASE
+                     : ((*remainder) + W3D_RETAIL_MILLISECONDS_PER_SECOND) / target;
     return current;
 }
 
@@ -341,6 +465,13 @@ static u32 STDCALL advance_w3d_time(u32 client_frame_delta)
  */
 static u32 THISCALL get_retail_visual_frame(void *game_client)
 {
+    struct kwfps_render_snapshot *snapshot=render_clock_current();
+    if (snapshot) {
+        if (!game_client || snapshot->active<g_retail_visual_fps) return 0;
+        return snapshot->guard ? sg_clock_retail(&snapshot->clock) :
+            (snapshot->clock.raw/snapshot->active)*g_retail_visual_fps+
+            ((snapshot->clock.raw%snapshot->active)*g_retail_visual_fps+snapshot->active-1u)/snapshot->active;
+    }
     void **vtable;
     GameClientGetFrameNumberFn get_frame_number;
     u32 actual_frame;
@@ -770,9 +901,13 @@ static u32 __attribute__((used, noinline)) variable_audio_delta_bits(u32 current
     u8 saved[527];
     void *aligned = (void *)(((uintptr_t)saved + 15u) & ~(uintptr_t)15u);
     __asm__ __volatile__("fxsave (%0)" ::"r"(aligned) : "memory");
-    sg_clock_sample(&g_frame_clock, current);
+    struct kwfps_render_snapshot *snapshot=render_clock_current();
+    struct sg_clock local;
+    struct sg_clock *clock=&g_frame_clock;
+    if (snapshot) {local=snapshot->clock;clock=&local;}
+    sg_clock_sample(clock, current);
     u32 frames = current - previous;
-    uint64_t ticks = frames <= 0x7fffffffu && frames <= g_frame_clock.frame ? sg_clock_span(&g_frame_clock, frames) : 0;
+    uint64_t ticks = frames <= 0x7fffffffu && frames <= clock->frame ? sg_clock_span(clock, frames) : 0;
     float value = (float)((double)ticks * 1000.0 / (double)SG_TIMEBASE);
     u32 bits;
     memcpy(&bits, &value, 4);
@@ -1121,6 +1256,8 @@ static void apply_live_camera_settings(void)
 
 void game_patches_reset_state(void)
 {
+    if (!render_clock_source_barrier()) return;
+    if (g_render_clock_session!=UINT32_MAX) ++g_render_clock_session;
     if (g_config != NULL) {
         sg_reset(&g_stall, g_config->target_fps);
         sg_clock_reset(&g_frame_clock, g_config->target_fps);
@@ -1162,7 +1299,8 @@ static void stall_apply_pending(void *engine_pointer)
     u32 rate = g_stall.pending;
     u8 *engine = engine_pointer;
     u8 *global_data = *(u8 **)game_address(g_game, g_game->timing.global_data_pointer);
-    if (rate >= SG_MIN_FPS && rate <= g_stall.requested && (rate + 15u == g_stall.active || rate == g_stall.active + 15u) && global_data) {
+    if (rate >= SG_MIN_FPS && rate <= g_stall.requested && (rate + 15u == g_stall.active || rate == g_stall.active + 15u) && global_data &&
+        render_clock_source_barrier()) {
         frame_clock_sample_current();
         if (sg_clock_change(&g_frame_clock, rate)) {
             sg_commit(&g_stall);

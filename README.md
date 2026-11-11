@@ -43,3 +43,20 @@ or libraries. Runtime provider discovery is automatic; absence is normal.
 Neutral broker checks always accommodate a separately reserved native wait,
 including standalone builds without that policy header. There is no AI plugin
 header, library, service lookup, ordering rule or build switch.
+
+
+## Optional rendering clock integration
+
+The versioned C interface in `include/kwfps/integration/render_clock.h` permits
+an independent renderer to retain private FPS history and visual-time state.
+It is discovered at runtime through `kwfps_get_render_clock_api_v1`; consumers
+use the public header without linking provider sources. Standalone FPS behavior
+requires no consumer or integration setting.
+
+Snapshots belong to their creating thread, require canonical writers to be
+quiescent during capture, and remain alive until actual consumer acknowledgement.
+Rendering scopes use strict LIFO order on one consumer thread. Canonical rate
+writes and session resets drain through the registered owner callback; ordinary
+phases without a rate change do not join rendering. This covers FPS helpers only,
+not native inline clock globals, complete scenes or simulation concurrency.
+The threading integration remains experimental and disabled by default.
