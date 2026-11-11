@@ -1,5 +1,9 @@
 # kw_plugin_fps_patch
 
+Licensed under **GPLv3**, with a game interoperability permission. See
+[LICENSING.md](LICENSING.md) for scope, source-distribution obligations and
+[third-party notices](THIRD_PARTY_NOTICES.md).
+
 Brokered FPS/interpolation and adaptive scheduling.
 
 ## Layout and build
