@@ -36,10 +36,17 @@ ALL_OBJECTS := $(sort $(FPS_OBJECTS))
 BIN_TARGETS := $(BIN_DIR)/kw_fps_patch.dll
 CONFIG_INPUTS := $(wildcard $(REPO_ROOT)/config/*)
 CONFIG_TARGETS := $(patsubst $(REPO_ROOT)/config/%,$(CONFIG_DIR)/%,$(CONFIG_INPUTS))
-.PHONY: all config developer clean
+.PHONY: all config developer clean test-render-clock-build
 all: $(BIN_DIR)/kw_fps_patch.dll config
 developer: $(BIN_TARGETS) config
 config: $(CONFIG_TARGETS)
+RENDER_CLOCK_TEST := $(OUT_DIR)/tests/test_render_clock.exe
+test-render-clock-build: $(RENDER_CLOCK_TEST)
+$(RENDER_CLOCK_TEST): $(REPO_ROOT)/tests/test_render_clock.c $(REPO_ROOT)/src/runtime/game_patches.c \
+    $(wildcard $(REPO_ROOT)/src/runtime/*.h) $(KWMOD_SDK_ROOT)/include/kwengine/timing/game_layout.h
+	@mkdir -p "$(@D)"
+	$(WINDOWS_CC) $(CPPFLAGS) $(CFLAGS) -static -ffunction-sections -fdata-sections -Wl,--gc-sections \
+	    "$(REPO_ROOT)/tests/test_render_clock.c" -lwinmm -lm -o "$@"
 $(CONFIG_DIR)/%: $(REPO_ROOT)/config/%
 	@mkdir -p "$(@D)"
 	cp "$<" "$@"
@@ -51,7 +58,7 @@ $(BIN_DIR)/kw_fps_patch.dll: $(FPS_OBJECTS) $(KWMOD_TIMING_LIB)
 	@mkdir -p "$(@D)"
 	$(WINDOWS_CC) $(DLL_FLAGS) $(FPS_OBJECTS) $(KWMOD_TIMING_LIB) -lwinmm -lm -o "$@"
 clean:
-	$(RM) $(BIN_TARGETS) $(ALL_OBJECTS) $(ALL_OBJECTS:.o=.d) $(CONFIG_TARGETS)
+	$(RM) $(BIN_TARGETS) $(ALL_OBJECTS) $(ALL_OBJECTS:.o=.d) $(CONFIG_TARGETS) $(RENDER_CLOCK_TEST)
 -include $(ALL_OBJECTS:.o=.d)
 
 BUNDLE_FILES := $(BIN_DIR)/kw_fps_patch.dll=plugins/kw_fps_patch.dll \

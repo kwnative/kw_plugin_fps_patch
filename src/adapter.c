@@ -12,6 +12,7 @@
 #include "runtime/config.h"
 #include <kwengine/timing/game_layout.h>
 #include <stdio.h>
+#include <stddef.h>
 static const struct kwf_context *fps_context;
 static uint32_t startup_wait_owned_elsewhere;
 static GamePacingWait startup_wait;
@@ -51,7 +52,7 @@ static uint32_t KWF_CALL fps_prepare(const struct kwf_context *context)
         return KWF_UNSUPPORTED;
     fps_context = context;
     patches = context->host->service(context->owner, KWF_PATCH_QUERY_SERVICE, 1);
-    if (!patches || patches->size < sizeof(*patches) || patches->version != 1 || !patches->find)
+    if (!patches || patches->size < offsetof(struct kwf_patch_query, find) + sizeof(patches->find) || patches->version != 1 || !patches->find)
         return KWF_UNSUPPORTED;
     startup_wait_owned_elsewhere = 0;
 #if WITH_PACING_INTEGRATION
