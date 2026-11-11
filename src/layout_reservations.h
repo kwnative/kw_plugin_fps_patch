@@ -1,3 +1,6 @@
+/* SPDX-FileCopyrightText: 2026 N.Leiten
+ * SPDX-License-Identifier: LicenseRef-KW-Game-Plugin
+ */
 #ifndef KW_FPS_LAYOUT_RESERVATIONS_H
 #define KW_FPS_LAYOUT_RESERVATIONS_H
 #include <kwf/plugin.h>

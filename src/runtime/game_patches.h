@@ -1,3 +1,6 @@
+/* SPDX-FileCopyrightText: 2026 N.Leiten
+ * SPDX-License-Identifier: LicenseRef-KW-Game-Plugin
+ */
 #ifndef FPS_PATCH_GAME_PATCHES_H
 #define FPS_PATCH_GAME_PATCHES_H
 

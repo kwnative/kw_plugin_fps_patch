@@ -1,3 +1,6 @@
+/* SPDX-FileCopyrightText: 2026 N.Leiten
+ * SPDX-License-Identifier: LicenseRef-KW-Game-Plugin
+ */
 /* Upstream-compatible writer API; every static mutation uses the host broker.
  * The pinned FPS implementation retains its transaction API. */
 #include "runtime/memory_patch.h"

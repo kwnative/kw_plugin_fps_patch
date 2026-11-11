@@ -1,3 +1,6 @@
+/* SPDX-FileCopyrightText: 2026 N.Leiten
+ * SPDX-License-Identifier: LicenseRef-KW-Game-Plugin
+ */
 #ifndef FPS_STALL_GUARD_H
 #define FPS_STALL_GUARD_H
 /* Presentation-rate control only: never advances a phase or admits a command.

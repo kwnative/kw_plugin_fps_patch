@@ -1,3 +1,6 @@
+/* SPDX-FileCopyrightText: 2026 N.Leiten
+ * SPDX-License-Identifier: LicenseRef-KW-Game-Plugin
+ */
 /* Plugin-owned FPS runtime, imported without the standalone DllMain or proxy.
  * The original runtime keeps ownership of stock 30-Hz initialization timing.
  * Only explicit prepare/activate callbacks are visible to the framework. */
