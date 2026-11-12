@@ -12,11 +12,28 @@ Production implementation is under `src/`; supported/public or compatibility
 headers are under `include/`. Generated files go only to ignored `build/`:
 `build/bin` for DLLs/executables, `build/lib` for libraries, `build/obj` for
 objects/dependency files, `build/config` for copied configuration templates.
-Use GNU Make and x86 MinGW (`i686-w64-mingw32-gcc/g++/ar`).
+
+### Linux prerequisites
+
+Use Bash, GNU Make 4.3+, native GCC/G++ (C++17 for bundle staging), and the
+32-bit Windows MinGW-w64 toolchain (`i686-w64-mingw32-gcc`,
+`i686-w64-mingw32-g++`, `i686-w64-mingw32-ar`).
+For Debian/Ubuntu, install `build-essential mingw-w64`. Wine is only needed
+to run the game or Windows test executables. No game files are needed to compile.
+
+A checkout of **kw_modloader** is the required SDK dependency. Build it first:
 
 ```sh
-make -j4
+export KWMOD_SDK_ROOT=/path/to/kw_modloader
+make -C "$KWMOD_SDK_ROOT" -j2
+```
+
+Then, from this plugin's directory:
+
+```sh
+make -j2
 make sdk-paths
+make bundle
 ```
 
 For relocated checkouts set `KWMOD_SDK_ROOT=/path/to/kw_modloader`.
@@ -32,11 +49,38 @@ Override `BUNDLE_DIR=/path/to/staging` if needed. This is a plugin overlay,
 not a standalone loader installation. Developer variants are not included.
 Bundle generation replaces only previously staged, unmodified files and
 refuses an unowned or locally edited output directory. Do not point it at an
-installed game. See `kw_modloader/docs/BUNDLES.md` for composition and AI caveats.
+installed game. See the loader's `docs/BUNDLES.md` for composition details.
 
 Build and staging targets do not install into a game or overwrite user settings.
 Use matching loader/SDK artifacts and preserve customized INIs when installing.
 Runtime loading uses `.kwplugin` manifests; configuration uses `.ini` files.
+
+### Manual installation
+
+**kw_modloader must be installed for this plugin to load.** With the game closed,
+copy the loader's `build/bundle/` contents into the engine directory containing
+`cnc3ep1.dat` (normally `RetailExe/1.2`). Then copy this plugin's
+`build/bundle/` contents into that same directory, retaining the `plugins/`,
+`docs/` and `licenses/` layout. The runtime files are:
+
+```text
+RetailExe/1.2/
+  dinput8.dll
+  kw_runtime.dll
+  kw_engine.dll
+  plugins/
+    kw_fps_patch.dll
+    kw_fps_patch.kwplugin
+    kw_fps_patch.ini
+```
+
+Preserve your customized INI when upgrading; merge new settings from the template.
+Check `enabled` in the manifest and restart the game after changing settings.
+There is no `make install` target or install-directory variable.
+`BUNDLE_DIR` selects a dedicated staging directory, never a live game directory.
+
+The current documented build host is Linux. Compiler overrides are retained for
+a future documented native Windows build; that workflow is not yet qualified.
 
 Optional pacing-protocol integration defaults off for standalone `make`/`all`.
 `bundle`/`stage` automatically compiles it when pacing's public header is
@@ -45,8 +89,7 @@ plugin list. Explicit `WITH_PACING_INTEGRATION=0|1` overrides the default.
 `PACING_SDK_ROOT` selects the provider's public policy header, never its sources
 or libraries. Runtime provider discovery is automatic; absence is normal.
 Neutral broker checks always accommodate a separately reserved native wait,
-including standalone builds without that policy header. There is no AI plugin
-header, library, service lookup, ordering rule or build switch.
+including standalone builds without that policy header.
 
 
 ## Optional rendering clock integration
